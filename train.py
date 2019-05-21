@@ -15,14 +15,16 @@ from mxnet.gluon.rnn import LSTMCell
 from mxnet.metric import TopKAccuracy, Loss, Accuracy
 from nltk.translate.bleu_score import corpus_bleu
 from dataset import CaptionDataSet, LeftTopPad
+from parallel import DataParallelModel
+from resnetv1b import resnet50_v1b
 
 
 class Encoder(nn.HybridBlock):
     def __init__(self):
         super(Encoder, self).__init__()
-        self.feature = gluoncv.model_zoo.resnet50_v1b(dilated=False, pretrained=True)
-        self.feature.fc.weight.grad_req = "null"
-        self.feature.fc.bias.grad_req = "null"
+        self.feature = resnet50_v1b(dilated=False, pretrained=True)
+        # self.feature.fc.weight.grad_req = "null"
+        # self.feature.fc.bias.grad_req = "null"
 
     def hybrid_forward(self, F, x):
         feat = self.feature
@@ -53,13 +55,20 @@ class Attention(nn.HybridBlock):
 
         att = self.full_att(F.broadcast_add(att1, att2).tanh()).squeeze(axis=2)  # (batch_size, num_pixels)
         alpha = att.softmax(axis=1)  # (batch_size, num_pixels)
-        attention_weighted_encoding = (F.broadcast_mul(encoder_out, alpha.expand_dims(2))).sum(axis=1)  # (batch_size, encoder_dim)
+        attention_weighted_encoding = (F.broadcast_mul(encoder_out, alpha.expand_dims(2))).sum(
+            axis=1)  # (batch_size, encoder_dim)
 
         return attention_weighted_encoding, alpha
 
 
 class DecoderWithAttention(nn.Block):
-    def __init__(self, num_words, max_len=185):
+    def __init__(self, num_words, max_len=185, use_current_state=True):
+        """
+        :param num_words:
+        :param max_len:
+        :param use_current_state: whether to use current_state h_k to analyse where to look,
+                see https://arxiv.org/pdf/1612.01887.pdf.
+        """
         super(DecoderWithAttention, self).__init__()
         self.hidden_size = 512
         self.lstm_cell = LSTMCell(hidden_size=self.hidden_size)
@@ -75,6 +84,7 @@ class DecoderWithAttention(nn.Block):
         self.dropout = nn.Dropout(rate=.5)
 
         self.max_len = max_len
+        self._use_current_state = use_current_state
 
     def forward(self, encoder_output: nd.NDArray, label=None, label_lengths=None):
         if label is None or label_lengths is None:
@@ -96,11 +106,19 @@ class DecoderWithAttention(nn.Block):
         label_embedded = self.embedding(label)
 
         for t in range(batch_max_len):
-            atten_weights, alpha = self.attention(encoder_output, h)
-            atten_weights = nd.sigmoid(self.f_beta(h)) * atten_weights
-            inputs = nd.concat(label_embedded[:, t], atten_weights, dim=1)
-            _, [h, c] = self.lstm_cell(inputs, [h, c])
-            preds = self.out(self.dropout(h))
+            if self._use_current_state:
+                _, [h, c] = self.lstm_cell(label_embedded[:, t], [h, c])
+                atten_weights, alpha = self.attention(encoder_output, h)
+                atten_weights = self.f_beta(h).sigmoid() * atten_weights
+                inputs = nd.concat(atten_weights, h, dim=1)
+                preds = self.out(self.dropout(inputs))
+                pass
+            else:
+                atten_weights, alpha = self.attention(encoder_output, h)
+                atten_weights = nd.sigmoid(self.f_beta(h)) * atten_weights
+                inputs = nd.concat(label_embedded[:, t], atten_weights, dim=1)
+                _, [h, c] = self.lstm_cell(inputs, [h, c])
+                preds = self.out(self.dropout(h))
             predictions.append(preds)
             alphas.append(alpha)
         predictions = nd.concat(*[x.expand_dims(axis=1) for x in predictions], dim=1)
@@ -220,10 +238,10 @@ def validate(net, val_loader, gpu_id, train_index2words, val_index2words):
 
 def main():
     epoches = 32
-    gpu_id = 6
-    ctx_list = [mx.gpu(x) for x in [gpu_id]]
+    gpu_id = 7
+    ctx_list = [mx.gpu(x) for x in [7, 8]]
     log_interval = 100
-    batch_size = 16
+    batch_size = 32
     start_epoch = 0
     # trainer_resume = resume + ".states" if resume is not None else None
     trainer_resume = None
@@ -313,7 +331,8 @@ def main():
     logger.info(dataset.words2index["<PAD>"])
     logger.info(val_dataset.words2index["<PAD>"])
     logger.info(len(val_dataset.words2index))
-    net.hybridize(static_alloc=True, static_shape=True)
+    # net.hybridize(static_alloc=True, static_shape=True)
+    net_parallel = DataParallelModel(net, ctx_list=ctx_list, sync=True)
     for nepoch in range(start_epoch, epoches):
         if nepoch > 15:
             trainer.set_learning_rate(4e-5)
@@ -326,15 +345,18 @@ def main():
         batch_bleu.reset()
         for nbatch, batch in enumerate(dataloader):
             batch = [mx.gluon.utils.split_and_load(x, ctx_list) for x in batch]
+            inputs = [[x[n] for x in batch] for n, _ in enumerate(ctx_list)]
             losses = []
             with ag.record():
-                for image, label, label_len in zip(*batch):
-                    predictions, alphas = net(image, label, label_len)
+                outputs = net_parallel(*inputs)
+                for s_batch, s_outputs in zip(inputs, outputs):
+                    image, label, label_len = s_batch
+                    predictions, alphas = s_outputs
                     ctc_loss = criterion(predictions, label, label_len)
                     loss2 = 1.0 * ((1. - alphas.sum(axis=1)) ** 2).mean()
                     losses.extend([ctc_loss, loss2])
             ag.backward(losses)
-            trainer.step(batch_size=image.shape[0], ignore_stale_grad=True)
+            trainer.step(batch_size=batch_size, ignore_stale_grad=True)
             for n, l in enumerate(label_len):
                 l = int(l.asscalar())
                 la = label[n, 1:l]
