@@ -17,6 +17,7 @@ from nltk.translate.bleu_score import corpus_bleu
 from dataset import CaptionDataSet, LeftTopPad
 from parallel import DataParallelModel
 from resnetv1b import resnet50_v1b
+import tqdm
 
 
 class Encoder(nn.HybridBlock):
@@ -61,8 +62,41 @@ class Attention(nn.HybridBlock):
         return attention_weighted_encoding, alpha
 
 
+class AdaptiveAttention(nn.HybridBlock):
+    def __init__(self, attention_dim):
+        """
+        An implementation of the AdaptiveAttention, see https://arxiv.org/pdf/1612.01887.pdf.
+        :param attention_dim:
+        """
+        super(AdaptiveAttention, self).__init__()
+        self.encoder_att = nn.Dense(attention_dim, flatten=False)  # linear layer to transform encoded image
+        self.decoder_att = nn.Dense(attention_dim, flatten=False)  # linear layer to transform decoder's output
+        self.full_att = nn.Dense(1, flatten=False,
+                                 prefix="full_attention")  # linear layer to calculate values to be softmax-ed
+        self.adaptive_w_h = nn.Dense(attention_dim, flatten=False)
+        self.adaptive_w_x = nn.Dense(attention_dim, flatten=False)
+        self.adaptive_w_s = nn.Dense(attention_dim, flatten=False)
+        self.adaptive_w_s_1 = nn.Dense(2048, flatten=False)
+
+    def hybrid_forward(self, F, encoder_out: nd.NDArray, decoder_hidden: nd.NDArray, x_t, memory_cell):
+        att1 = self.encoder_att(encoder_out)  # (batch_size, num_pixels, attention_dim)
+        att2 = self.decoder_att(decoder_hidden).expand_dims(axis=1)  # (batch_size, attention_dim)
+
+        s_t = (self.adaptive_w_h(decoder_hidden) + self.adaptive_w_x(x_t)).sigmoid() * memory_cell.tanh()
+        beta_pre = self.full_att((self.adaptive_w_s(s_t) + self.decoder_att(s_t)).tanh())
+
+        att = self.full_att(F.broadcast_add(att1, att2).tanh()).squeeze(axis=2)  # (batch_size, num_pixels)
+        att_with_beta = F.concat(att, beta_pre, dim=1)
+        alpha = att_with_beta.softmax(axis=1)  # (batch_size, num_pixels)
+        alpha_1 = F.slice_axis(alpha, axis=1, begin=0, end=-1)
+        beta = F.slice_axis(alpha, axis=1, begin=-1, end=None)
+        attention_weighted_encoding = (F.broadcast_mul(encoder_out, alpha_1.expand_dims(2))).sum(axis=1)
+        c_t = F.broadcast_mul(1-beta, attention_weighted_encoding) + self.adaptive_w_s_1(F.broadcast_mul(beta, s_t))
+        return c_t, alpha_1
+
+
 class DecoderWithAttention(nn.Block):
-    def __init__(self, num_words, max_len=185, use_current_state=True):
+    def __init__(self, num_words, max_len=185, use_current_state=True, use_adaptive_attention=True):
         """
         :param num_words:
         :param max_len:
@@ -72,7 +106,10 @@ class DecoderWithAttention(nn.Block):
         super(DecoderWithAttention, self).__init__()
         self.hidden_size = 512
         self.lstm_cell = LSTMCell(hidden_size=self.hidden_size)
-        self.attention = Attention(attention_dim=self.hidden_size)
+        if use_adaptive_attention:
+            self.attention = AdaptiveAttention(attention_dim=self.hidden_size)
+        else:
+            self.attention = Attention(attention_dim=self.hidden_size)
         self.num_words = num_words
 
         self.init_h = nn.Dense(self.hidden_size, flatten=False)
@@ -85,6 +122,7 @@ class DecoderWithAttention(nn.Block):
 
         self.max_len = max_len
         self._use_current_state = use_current_state
+        self._use_adaptive_attention = use_adaptive_attention
 
     def forward(self, encoder_output: nd.NDArray, label=None, label_lengths=None):
         if label is None or label_lengths is None:
@@ -108,7 +146,10 @@ class DecoderWithAttention(nn.Block):
         for t in range(batch_max_len):
             if self._use_current_state:
                 _, [h, c] = self.lstm_cell(label_embedded[:, t], [h, c])
-                atten_weights, alpha = self.attention(encoder_output, h)
+                if self._use_adaptive_attention:
+                    atten_weights, alpha = self.attention(encoder_output, h, label_embedded[:, t], c)
+                else:
+                    atten_weights, alpha = self.attention(encoder_output, h)
                 atten_weights = self.f_beta(h).sigmoid() * atten_weights
                 inputs = nd.concat(atten_weights, h, dim=1)
                 preds = self.out(self.dropout(inputs))
@@ -343,7 +384,7 @@ def main():
         alpha_metric.reset()
         epoch_bleu.reset()
         batch_bleu.reset()
-        for nbatch, batch in enumerate(dataloader):
+        for nbatch, batch in enumerate(tqdm.tqdm(dataloader)):
             batch = [mx.gluon.utils.split_and_load(x, ctx_list) for x in batch]
             inputs = [[x[n] for x in batch] for n, _ in enumerate(ctx_list)]
             losses = []
