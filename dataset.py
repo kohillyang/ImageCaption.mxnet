@@ -5,6 +5,7 @@ import numpy as np
 from tqdm import tqdm
 from itertools import chain
 import mxnet as mx
+from collections import defaultdict
 
 
 class LeftTopPad(mx.image.Augmenter):
@@ -38,9 +39,11 @@ def convert_dataset(annotation_path):
     all_captions = [x["caption"] for x in obj["annotations"]]
     all_captions = [x.replace(".", "").strip().split() for x in all_captions]
     print("Creating dictionaries, this can take some time...")
-    all_words = set()
+    all_words_count = defaultdict(lambda: 0)
     for sen in all_captions:
-        all_words.update(sen)
+        for w in sen:
+            all_words_count[w] += 1
+    all_words = [k for k in all_words_count.keys() if all_words_count[k] >= 5]
     print("Creating dictionaries finished.")
 
     words2index = {}
@@ -112,3 +115,17 @@ class CaptionDataSet(mx.gluon.data.Dataset):
 
     def __len__(self):
         return len(self.objs)
+
+
+if __name__ == '__main__':
+    dataset = CaptionDataSet(image_root="/data3/zyx/yks/coco2017/train2017",
+                             annotation_path="/data3/zyx/yks/coco2017/annotations/captions_train2017.json",
+                             transforms=None
+                             )
+    val_dataset = CaptionDataSet(image_root="/data3/zyx/yks/coco2017/val2017",
+                                 annotation_path="/data3/zyx/yks/coco2017/annotations/captions_val2017.json",
+                                 words2index=dataset.words2index,
+                                 index2words=dataset.index2words,
+                                 transforms=None
+                                 )
+    print(len(dataset.words2index))
