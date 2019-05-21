@@ -17,14 +17,14 @@ from nltk.translate.bleu_score import corpus_bleu
 from dataset import CaptionDataSet, LeftTopPad
 
 
-class Encoder(nn.Block):
+class Encoder(nn.HybridBlock):
     def __init__(self):
         super(Encoder, self).__init__()
         self.feature = gluoncv.model_zoo.resnet50_v1b(dilated=False, pretrained=True)
         self.feature.fc.weight.grad_req = "null"
         self.feature.fc.bias.grad_req = "null"
 
-    def forward(self, x):
+    def hybrid_forward(self, F, x):
         feat = self.feature
         fm0 = feat.conv1(x)
         fm0 = feat.bn1(fm0)
@@ -39,7 +39,7 @@ class Encoder(nn.Block):
         return fm4
 
 
-class Attention(nn.Block):
+class Attention(nn.HybridBlock):
     def __init__(self, attention_dim):
         super(Attention, self).__init__()
         self.encoder_att = nn.Dense(attention_dim, flatten=False)  # linear layer to transform encoded image
@@ -47,12 +47,13 @@ class Attention(nn.Block):
         self.full_att = nn.Dense(1, flatten=False,
                                  prefix="full_attention")  # linear layer to calculate values to be softmax-ed
 
-    def forward(self, encoder_out: nd.NDArray, decoder_hidden: nd.NDArray):
+    def hybrid_forward(self, F, encoder_out: nd.NDArray, decoder_hidden: nd.NDArray):
         att1 = self.encoder_att(encoder_out)  # (batch_size, num_pixels, attention_dim)
-        att2 = self.decoder_att(decoder_hidden)  # (batch_size, attention_dim)
-        att = self.full_att(nd.relu(att1 + nd.expand_dims(att2, axis=1))).squeeze(axis=2)  # (batch_size, num_pixels)
-        alpha = nd.softmax(att, axis=1)  # (batch_size, num_pixels)
-        attention_weighted_encoding = (encoder_out * alpha.expand_dims(2)).sum(axis=1)  # (batch_size, encoder_dim)
+        att2 = self.decoder_att(decoder_hidden).expand_dims(axis=1)  # (batch_size, attention_dim)
+
+        att = self.full_att(F.broadcast_add(att1, att2).tanh()).squeeze(axis=2)  # (batch_size, num_pixels)
+        alpha = att.softmax(axis=1)  # (batch_size, num_pixels)
+        attention_weighted_encoding = (F.broadcast_mul(encoder_out, alpha.expand_dims(2))).sum(axis=1)  # (batch_size, encoder_dim)
 
         return attention_weighted_encoding, alpha
 
@@ -312,7 +313,7 @@ def main():
     logger.info(dataset.words2index["<PAD>"])
     logger.info(val_dataset.words2index["<PAD>"])
     logger.info(len(val_dataset.words2index))
-
+    net.hybridize(static_alloc=True, static_shape=True)
     for nepoch in range(start_epoch, epoches):
         if nepoch > 15:
             trainer.set_learning_rate(4e-5)

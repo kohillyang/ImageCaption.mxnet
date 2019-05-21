@@ -46,7 +46,7 @@ def convert_dataset(annotation_path):
     words2index = {}
     index2words = {}
     for c, w in enumerate(chain(["<START>", "<END>"], all_words, ["<PAD>"])):
-        word_index = c 
+        word_index = c
         words2index[w] = word_index
         index2words[word_index] = w
 
