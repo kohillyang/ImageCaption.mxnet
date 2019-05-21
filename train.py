@@ -91,12 +91,12 @@ class AdaptiveAttention(nn.HybridBlock):
         alpha_1 = F.slice_axis(alpha, axis=1, begin=0, end=-1)
         beta = F.slice_axis(alpha, axis=1, begin=-1, end=None)
         attention_weighted_encoding = (F.broadcast_mul(encoder_out, alpha_1.expand_dims(2))).sum(axis=1)
-        c_t = F.broadcast_mul(1-beta, attention_weighted_encoding) + self.adaptive_w_s_1(F.broadcast_mul(beta, s_t))
+        c_t = F.broadcast_mul(1 - beta, attention_weighted_encoding) + self.adaptive_w_s_1(F.broadcast_mul(beta, s_t))
         return c_t, alpha_1
 
 
 class DecoderWithAttention(nn.Block):
-    def __init__(self, num_words, max_len=185, use_current_state=True, use_adaptive_attention=True):
+    def __init__(self, num_words, max_len=32, use_current_state=True, use_adaptive_attention=True):
         """
         :param num_words:
         :param max_len:
@@ -125,12 +125,11 @@ class DecoderWithAttention(nn.Block):
         self._use_adaptive_attention = use_adaptive_attention
 
     def forward(self, encoder_output: nd.NDArray, label=None, label_lengths=None):
-        if label is None or label_lengths is None:
-            return self.forward_test(encoder_output)
+        no_label = label is None or label_lengths is None
 
         encoder_output = nd.transpose(encoder_output, (0, 2, 3, 1))
         encoder_output = encoder_output.reshape((encoder_output.shape[0], -1, encoder_output.shape[3]))
-        batch_max_len = int(label_lengths.max().asscalar()) - 1
+        batch_max_len = self.max_len if no_label else int(label_lengths.max().asscalar()) - 1
 
         # Initialize hidden states
         encoder_output_mean = encoder_output.mean(axis=1)
@@ -141,58 +140,30 @@ class DecoderWithAttention(nn.Block):
         predictions = []
         alphas = []
 
-        label_embedded = self.embedding(label)
-
+        if not no_label:
+            label_embedded = self.embedding(label)
+        else:
+            bs = encoder_output.shape[0]
+            x_t = self.embedding(nd.zeros(shape=(bs,), ctx=encoder_output.context))
         for t in range(batch_max_len):
+            if not no_label:
+                x_t = label_embedded[:, t]
             if self._use_current_state:
-                _, [h, c] = self.lstm_cell(label_embedded[:, t], [h, c])
+                _, [h, c] = self.lstm_cell(x_t, [h, c])
                 if self._use_adaptive_attention:
-                    atten_weights, alpha = self.attention(encoder_output, h, label_embedded[:, t], c)
+                    atten_weights, alpha = self.attention(encoder_output, h, x_t, c)
                 else:
                     atten_weights, alpha = self.attention(encoder_output, h)
                 atten_weights = self.f_beta(h).sigmoid() * atten_weights
                 inputs = nd.concat(atten_weights, h, dim=1)
                 preds = self.out(self.dropout(inputs))
-                pass
             else:
                 atten_weights, alpha = self.attention(encoder_output, h)
                 atten_weights = nd.sigmoid(self.f_beta(h)) * atten_weights
-                inputs = nd.concat(label_embedded[:, t], atten_weights, dim=1)
+                inputs = nd.concat(x_t, atten_weights, dim=1)
                 _, [h, c] = self.lstm_cell(inputs, [h, c])
                 preds = self.out(self.dropout(h))
-            predictions.append(preds)
-            alphas.append(alpha)
-        predictions = nd.concat(*[x.expand_dims(axis=1) for x in predictions], dim=1)
-        alphas = nd.concat(*[x.expand_dims(axis=1) for x in alphas], dim=1)
-
-        return predictions, alphas
-
-    def forward_test(self, encoder_output: nd.NDArray):
-        bs = encoder_output.shape[0]
-
-        encoder_output = nd.transpose(encoder_output, (0, 2, 3, 1))
-        encoder_output = encoder_output.reshape((encoder_output.shape[0], -1, encoder_output.shape[3]))
-        batch_max_len = self.max_len
-
-        # Initialize hidden states
-        encoder_output_mean = encoder_output.mean(axis=1)
-        h = self.init_h(encoder_output_mean)
-        c = self.init_c(encoder_output_mean)
-
-        # Two tensors to store outputs
-        predictions = []
-        alphas = []
-
-        last_preds = nd.zeros(shape=(bs,), ctx=encoder_output.context)
-
-        for t in range(batch_max_len):
-            atten_weights, alpha = self.attention(encoder_output, h)
-            atten_weights = nd.sigmoid(self.f_beta(h)) * atten_weights
-            last_preds_embedded = self.embedding(last_preds)
-            inputs = nd.concat(last_preds_embedded, atten_weights, dim=1)
-            _, [h, c] = self.lstm_cell(inputs, [h, c])
-            preds = self.out(self.dropout(h))
-            last_preds = preds.argmax(axis=1)
+            x_t = self.embedding(preds.argmax(axis=1))
             predictions.append(preds)
             alphas.append(alpha)
         predictions = nd.concat(*[x.expand_dims(axis=1) for x in predictions], dim=1)
@@ -264,7 +235,7 @@ def validate(net, val_loader, gpu_id, train_index2words, val_index2words):
     metruc_acc = Accuracy()
     metruc_acc.reset()
     metric.reset()
-    for batch in val_loader:
+    for batch in tqdm.tqdm(val_loader):
         batch = [x.as_in_context(mx.gpu(gpu_id)) for x in batch]
         image, label, label_len = batch
         predictions, alphas = net(image, None, None)
@@ -389,6 +360,7 @@ def main():
             inputs = [[x[n] for x in batch] for n, _ in enumerate(ctx_list)]
             losses = []
             with ag.record():
+                net_parallel.sync = nbatch > 1
                 outputs = net_parallel(*inputs)
                 for s_batch, s_outputs in zip(inputs, outputs):
                     image, label, label_len = s_batch
