@@ -67,7 +67,7 @@ def convert_dataset(annotation_path):
 
 
 class CaptionDataSet(mx.gluon.data.Dataset):
-    def __init__(self, image_root, annotation_path, index2words=None, words2index=None, transforms=None):
+    def __init__(self, image_root, annotation_path, index2words=None, words2index=None, transforms=None, feature_hdf5=None):
         super(CaptionDataSet, self).__init__()
         objs, wi, iw = convert_dataset(annotation_path)
         self.objs = list(filter(lambda x: len(x["sentences"][0]["tokens"]) >= 1, objs["images"]))
@@ -80,7 +80,11 @@ class CaptionDataSet(mx.gluon.data.Dataset):
         self._max_len = max([len(x["sentences"][0]["tokens"]) for x in self.objs]) + 2
         self.transforms = transforms
         self._image_root = image_root
-
+        if feature_hdf5 is not None:
+            import h5py
+            self.f_feature_hdf5 = h5py.File(feature_hdf5, "r")
+        else:
+            self.f_feature_hdf5 = None
     @property
     def max_len(self):
         return self._max_len
@@ -100,9 +104,14 @@ class CaptionDataSet(mx.gluon.data.Dataset):
         label_padded = np.empty((self.max_len,), dtype=np.int32)
         label_padded.fill(0)
         label_padded[:label.shape[0]] = label
-        if self.transforms is not None:
+        if self.f_feature_hdf5 is None:
+            if self.transforms is not None:
+                image = mx.nd.array(image)
+                image = self.transforms(image)
+        else:
+            image = self.f_feature_hdf5[os.path.basename(filepath)]
+            image = np.array(image)
             image = mx.nd.array(image)
-            image = self.transforms(image)
         assert label_len > 1
         return image.asnumpy(), label_padded.astype(np.float32), np.array([label_len]).astype(np.float32)
 
@@ -111,7 +120,7 @@ class CaptionDataSet(mx.gluon.data.Dataset):
         filename = oneimg["filename"]
         filepath = os.path.join(self._image_root, filename)
         sentences = oneimg["sentences"][0]["tokens"]
-        return filepath, cv2.imread(filepath)[:, :, ::-1], sentences
+        return filepath, None if self.f_feature_hdf5 is not None else cv2.imread(filepath)[:, :, ::-1], sentences
 
     def __len__(self):
         return len(self.objs)
