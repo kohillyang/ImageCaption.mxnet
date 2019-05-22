@@ -23,21 +23,12 @@ import tqdm
 class Encoder(nn.HybridBlock):
     def __init__(self):
         super(Encoder, self).__init__()
-        self.feature = resnet50_v1b(dilated=False, pretrained=True)
+        # self.feature = resnet50_v1b(dilated=False, pretrained=True)
         # self.feature.fc.weight.grad_req = "null"
         # self.feature.fc.bias.grad_req = "null"
 
     def hybrid_forward(self, F, x):
-        feat = self.feature
-        fm0 = feat.conv1(x)
-        fm0 = feat.bn1(fm0)
-        fm0 = feat.relu(fm0)
-        fm0 = feat.maxpool(fm0)
-
-        fm1 = feat.layer1(fm0)
-        fm2 = feat.layer2(fm1)
-        fm3 = feat.layer3(fm2)
-        fm4 = feat.layer4(fm3)
+        return x
 
         return fm4
 
@@ -267,17 +258,19 @@ def main():
     ])
     dataset = CaptionDataSet(image_root="/data3/zyx/yks/coco2017/train2017",
                              annotation_path="/data3/zyx/yks/coco2017/annotations/captions_train2017.json",
-                             transforms=transform_fn
+                             transforms=transform_fn,
+                             feature_hdf5="output/train2017.h5"
                              )
     val_dataset = CaptionDataSet(image_root="/data3/zyx/yks/coco2017/val2017",
                                  annotation_path="/data3/zyx/yks/coco2017/annotations/captions_val2017.json",
                                  words2index=dataset.words2index,
                                  index2words=dataset.index2words,
-                                 transforms=transform_fn
+                                 transforms=transform_fn,
+                                 feature_hdf5="output/val2017.h5"
                                  )
-    dataloader = DataLoader(dataset=dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True,
+    dataloader = DataLoader(dataset=dataset, batch_size=batch_size, shuffle=True, num_workers=1, pin_memory=True,
                             last_batch="discard")
-    val_loader = DataLoader(dataset=val_dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True)
+    val_loader = DataLoader(dataset=val_dataset, batch_size=batch_size, shuffle=True, num_workers=1, pin_memory=True)
 
     num_words = dataset.words_count
 

@@ -137,4 +137,4 @@ if __name__ == '__main__':
                                  index2words=dataset.index2words,
                                  transforms=None
                                  )
-    print(len(dataset.words2index))
+    print(val_dataset._max_len)
